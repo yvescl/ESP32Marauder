@@ -162,7 +162,7 @@ void Display::setCalData(bool landscape) {
   #if !defined(HAS_CYD_TOUCH) && !defined(HAS_CAP_TOUCH)
     if (!landscape) {
       #ifdef TFT_SHIELD
-        uint16_t calData[5] = { 275, 3494, 361, 3528, 4 }; // tft.setRotation(0); // Portrait with TFT Shield
+        uint16_t calData[5] = { 415, 3186, 409, 3310, 4 }; // tft.setRotation(0); // Portrait - calibrated for this specific panel
       #elif defined(MARAUDER_CYD_3_5_INCH)
         uint16_t calData[5] = { 239, 3560, 262, 3643, 4 };
       #elif defined(MARAUDER_V8)
