@@ -33,6 +33,10 @@ This is a personal build log/fork documenting a DIY ESP32 Marauder v4 build usin
 **Mechanical:**
 - [`mechanical/OG-Marauder/`](mechanical/OG-Marauder/) includes gcode/STL files for a case for this build
 
+**Diagnostic sketches** ([`diy_build_sketches/`](diy_build_sketches/)) used to bring this build up - handy if you're wiring the same panel type:
+- [`TouchCalibrate/`](diy_build_sketches/TouchCalibrate/TouchCalibrate.ino) - runs a firm-hold, noise-resistant touch calibration (the stock TFT_eSPI `calibrateTouch()` threshold was too sensitive for this panel's idle noise floor) and displays the resulting `calData[5]` on screen
+- [`SDTest/`](diy_build_sketches/SDTest/SDTest.ino) - mounts the SD card on the shared SPI bus and reports card type/size/filesystem status
+
 Firmware itself is otherwise unmodified from upstream [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder) - see below for the original project's documentation.
 
 ## Getting Started
