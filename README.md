@@ -19,6 +19,22 @@
 [![Build and Push](https://github.com/justcallmekoko/ESP32Marauder/actions/workflows/build_push.yml/badge.svg)](https://github.com/justcallmekoko/ESP32Marauder/actions/workflows/build_push.yml)
 [![Firmware coverage](https://codecov.io/gh/justcallmekoko/ESP32Marauder/branch/develop/graph/badge.svg?flag=firmware-unit-tests)](https://app.codecov.io/gh/justcallmekoko/ESP32Marauder/tree/develop)
 
+## This Fork
+
+This is a personal build log/fork documenting a DIY ESP32 Marauder v4 build using a generic **ESP32-WROOM** dev board wired by hand to a **2.8" ILI9341 SPI display with XPT2046 touch**, rather than the official Marauder v4 PCB.
+
+**Changes from upstream:**
+- [`esp32_marauder/Display.cpp`](esp32_marauder/Display.cpp) - touch calibration constants replaced with values measured for this specific panel (the stock `TFT_SHIELD` calibration didn't match a non-reference display/touch module)
+
+**Wiring reference:**
+- [`esp32_wroom32_pinout.png`](esp32_wroom32_pinout.png) - full ESP32-WROOM-32 module pinout
+- [`marauder_v4_tft_schematic.png`](marauder_v4_tft_schematic.png) - ESP32-WROOM to ILI9341 + XPT2046 touch wiring (display and touch share one SPI bus with separate CS pins; see the diagram for the full pin table)
+
+**Mechanical:**
+- [`mechanical/OG-Marauder/`](mechanical/OG-Marauder/) includes gcode/STL files for a case for this build
+
+Firmware itself is otherwise unmodified from upstream [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder) - see below for the original project's documentation.
+
 ## Getting Started
 Download the [latest release](https://github.com/justcallmekoko/ESP32Marauder/releases/latest) of the firmware.  
 
