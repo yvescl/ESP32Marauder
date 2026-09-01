@@ -8,3 +8,9 @@ coverage.xml
 esp32_marauder/.vscode/settings.json
 __pycache__/
 *.pyc
+
+# Local Arduino toolchain (arduino-cli data/user dirs, board cores, libraries)
+.arduino15/
+.arduino_user/
+.tools/
+build/
