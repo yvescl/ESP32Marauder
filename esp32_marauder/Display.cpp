@@ -1,8 +1,54 @@
 #include "Display.h"
+#include "BootSplashBitmap.h"
 #include "DisplayLine.h"
 #include "lang_var.h"
 
 #ifdef HAS_SCREEN
+
+extern void backlightOn();
+
+namespace {
+
+uint8_t readLogoAlpha(uint16_t x, uint16_t y) {
+  const uint32_t pixel_index = static_cast<uint32_t>(y) * JCMK_LOGO_WIDTH + x;
+  const uint8_t packed = pgm_read_byte(JCMK_LOGO_BITMAP + pixel_index / 2);
+  return pixel_index & 1 ? packed & 0x0F : packed >> 4;
+}
+
+uint8_t sampleLogoAlpha(uint32_t source_x, uint32_t source_y) {
+  const uint16_t x0 = source_x >> 8;
+  const uint16_t y0 = source_y >> 8;
+  const uint16_t x1 = x0 + 1 < JCMK_LOGO_WIDTH ? x0 + 1 : x0;
+  const uint16_t y1 = y0 + 1 < JCMK_LOGO_HEIGHT ? y0 + 1 : y0;
+  const uint8_t x_fraction = source_x & 0xFF;
+  const uint8_t y_fraction = source_y & 0xFF;
+
+  const uint16_t top = readLogoAlpha(x0, y0) * (256 - x_fraction) +
+                       readLogoAlpha(x1, y0) * x_fraction;
+  const uint16_t bottom = readLogoAlpha(x0, y1) * (256 - x_fraction) +
+                          readLogoAlpha(x1, y1) * x_fraction;
+  return ((top * (256 - y_fraction) + bottom * y_fraction) + 32768) >> 16;
+}
+
+bool cleanLogoPixel(int16_t x, int16_t y, int16_t width, int16_t height,
+                    uint32_t source_x_step, uint32_t source_y_step) {
+  uint8_t white_neighbors = 0;
+  for (int8_t y_offset = -1; y_offset <= 1; ++y_offset) {
+    const int16_t sample_y = y + y_offset;
+    if (sample_y < 0 || sample_y >= height) continue;
+    for (int8_t x_offset = -1; x_offset <= 1; ++x_offset) {
+      const int16_t sample_x = x + x_offset;
+      if (sample_x < 0 || sample_x >= width) continue;
+      if (sampleLogoAlpha(sample_x * source_x_step,
+                          sample_y * source_y_step) >= 8) {
+        ++white_neighbors;
+      }
+    }
+  }
+  return white_neighbors >= 5;
+}
+
+}  // namespace
 
 Display::Display()
 #ifdef HAS_CYD_TOUCH
@@ -47,7 +93,44 @@ uint8_t Display::updateTouch(uint16_t *x, uint16_t *y, uint16_t threshold) {
         // FT6336 capacitive touch: rotation-aware + edge exclusion
         {
           uint16_t raw_x, raw_y;
-          if (!ft6336_read_raw(&raw_x, &raw_y)) return 0;
+          const int8_t touch_state = ft6336_read_raw(&raw_x, &raw_y);
+          if (touch_state != 1) {
+            #ifdef MARAUDER_M5STACK_CORE2_AWS
+              // Only bridge I2C transport errors. A confirmed zero-touch
+              // status is a real release and must not delay the next tap.
+              if (touch_state < 0 && core2_front_button >= 0 &&
+                  millis() - core2_front_button_seen < 250) {
+                *x = TFT_WIDTH / 2;
+                *y = TFT_HEIGHT / 3 * core2_front_button + (TFT_HEIGHT / 6);
+                return 1;
+              }
+              core2_front_button = -1;
+            #endif
+            return 0;
+          }
+
+          #ifdef MARAUDER_M5STACK_CORE2_AWS
+            // Core2 reports its LCD in landscape coordinates. The lower
+            // 40-pixel touch-only strip implements the three front buttons.
+            if (raw_y >= 240 && raw_y < 280) {
+              if (core2_full_touch_input) return 0;
+              uint8_t button = raw_x < 120 ? UP_BUTTON :
+                               raw_x < 220 ? SELECT_BUTTON : DOWN_BUTTON;
+              core2_front_button = button;
+              core2_front_button_seen = millis();
+              *x = TFT_WIDTH / 2;
+              *y = TFT_HEIGHT / 3 * button + (TFT_HEIGHT / 6);
+              return 1;
+            }
+            core2_front_button = -1;
+            // Normal operation deliberately ignores the LCD surface. It is
+            // enabled only while the fallback on-screen keyboard is active.
+            if (!core2_full_touch_input) return 0;
+            if (raw_x >= SCREEN_WIDTH || raw_y >= SCREEN_HEIGHT) return 0;
+            *x = raw_x;
+            *y = raw_y;
+            return 1;
+          #endif
 
           // Discard touches within PANCAKE_TOUCH_MARGIN pixels of any panel edge
           #define PANCAKE_PANEL_W TFT_WIDTH
@@ -152,10 +235,7 @@ bool Display::isTouchHeld(uint16_t threshold) {
 
 void Display::init() {
   tft.init();
-
-  #if defined(HAS_DUAL_BAND) && !defined(MARAUDER_MINI_V3)
-    digitalWrite(TFT_BL, HIGH);
-  #endif
+  backlightOn();
 }
 
 void Display::setCalData(bool landscape) {
@@ -240,6 +320,65 @@ void Display::RunSetup() {
 
     digitalWrite(7, HIGH);
   #endif
+}
+
+void Display::drawBootSplash() {
+  const int16_t width = tft.width();
+  const int16_t height = tft.height();
+  #ifdef MARAUDER_POOM
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextWrap(false);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("ESP32 Marauder", width / 2, 10, 1);
+    tft.drawCentreString(version_number, width / 2, 27, 1);
+    tft.drawCentreString("POOM", width / 2, 44, 1);
+    tft.display(true);
+    return;
+  #endif
+  #if defined(MARAUDER_CYD_3_5_INCH) || defined(MARAUDER_PANCAKE)
+    constexpr bool half_scale_logo = true;
+  #else
+    constexpr bool half_scale_logo = false;
+  #endif
+  const marauder::BootSplashLayout layout =
+      marauder::bootSplashLayout(width, height, half_scale_logo);
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextWrap(false);
+  tft.setFreeFont(NULL);
+  tft.setTextSize(layout.text_size);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("ESP32 Marauder", width / 2, layout.title_y, 1);
+
+  const uint32_t source_x_step = layout.logo_width > 1
+      ? (static_cast<uint32_t>(JCMK_LOGO_WIDTH - 1) << 8) /
+            (layout.logo_width - 1)
+      : 0;
+  const uint32_t source_y_step = layout.logo_height > 1
+      ? (static_cast<uint32_t>(JCMK_LOGO_HEIGHT - 1) << 8) /
+            (layout.logo_height - 1)
+      : 0;
+  for (int16_t y = 0; y < layout.logo_height; ++y) {
+    int16_t run_start = -1;
+    for (int16_t x = 0; x <= layout.logo_width; ++x) {
+      const bool white = x < layout.logo_width &&
+          cleanLogoPixel(x, y, layout.logo_width, layout.logo_height,
+                         source_x_step, source_y_step);
+      if (white && run_start < 0) run_start = x;
+      if (!white && run_start >= 0) {
+        tft.drawFastHLine(layout.logo_x + run_start, layout.logo_y + y,
+                          x - run_start, TFT_WHITE);
+        run_start = -1;
+      }
+    }
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString(version_number, width / 2, layout.version_y, 1);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawCentreString("Initializing...", width / 2, layout.status_y, 1);
+  tft.setTextSize(1);
 }
 
 void Display::tftDrawGraphObjects(byte x_scale)
@@ -341,6 +480,9 @@ void Display::tftDrawYScaleButtons(byte y_scale)
 }
 
 void Display::tftDrawChannelScaleButtons(int set_channel, bool lnd_an) {
+  #ifdef MARAUDER_POOM
+    return;
+  #endif
   #ifdef MARAUDER_PANCAKE
     TOP_FIXED_AREA_2 = lnd_an ? 48 : 64;
   #endif
@@ -401,6 +543,9 @@ void Display::tftDrawChannelScaleButtons(int set_channel, bool lnd_an) {
 }
 
 void Display::tftDrawChanHopButton(bool lnd_an, bool en) {
+  #ifdef MARAUDER_POOM
+    return;
+  #endif
   #ifdef MARAUDER_PANCAKE
     TOP_FIXED_AREA_2 = lnd_an ? 48 : 64;
   #endif
@@ -462,6 +607,9 @@ void Display::tftDrawChanHopButton(bool lnd_an, bool en) {
 }
 
 void Display::tftDrawExitScaleButtons(bool lnd_an) {
+  #ifdef MARAUDER_POOM
+    return;
+  #endif
   #ifdef MARAUDER_PANCAKE
     TOP_FIXED_AREA_2 = lnd_an ? 48 : 64;
   #endif
@@ -518,8 +666,8 @@ void Display::twoPartDisplay(String center_text)
 void Display::touchToExit()
 {
   tft.setTextColor(TFT_BLACK, TFT_LIGHTGREY);
-  tft.fillRect(0,32,HEIGHT_1,16, TFT_LIGHTGREY);
-  tft.drawCentreString(text11,TFT_WIDTH / 2,32,2);
+  tft.fillRect(0, 32, SCREEN_WIDTH, 16, TFT_LIGHTGREY);
+  tft.drawCentreString(text11, SCREEN_WIDTH / 2, 32, 2);
 }
 
 
@@ -589,6 +737,20 @@ void Display::processAndPrintString(TFT_eSPI& tft, const String& originalString)
   tft.print(line);
 }
 
+bool Display::queueLine(const String& line) {
+  if (display_buffer == nullptr) return false;
+  if (!display_queue_pressure.allow(display_buffer->size())) return false;
+  if (!marauder::RuntimeMemoryGuard::instance().allow(line.length() + 48))
+    return false;
+  return display_buffer->add(line);
+}
+
+bool Display::queueCriticalLine(const String& line) {
+  if (display_buffer == nullptr) return false;
+  if (!display_queue_pressure.allow(display_buffer->size())) return false;
+  return display_buffer->add(line);
+}
+
 void Display::displayBuffer(bool do_clear)
 {
   if (this->display_buffer->size() > 0)
@@ -627,7 +789,9 @@ void Display::displayBuffer(bool do_clear)
         screen_buffer->add(display_buffer->shift());
 
         for (int i = 0; i < this->screen_buffer->size(); i++) {
-		  #ifdef MARAUDER_PANCAKE
+		  #ifdef MARAUDER_POOM
+			tft.setCursor(xPos, STATUS_BAR_WIDTH + (i * TEXT_HEIGHT));
+		  #elif defined(MARAUDER_PANCAKE)
 			tft.setCursor(xPos, (i * TEXT_HEIGHT) + TOP_FIXED_AREA_2);
 		  #else
 			#ifdef HAS_TOUCH

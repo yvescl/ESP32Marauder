@@ -5,6 +5,10 @@
 
 #include "configs.h"
 #include "utils.h"
+#include "GpsTrackerStats.h"
+#include "IBeacon.h"
+#include "RemoteIdDecoder.h"
+#include "WigleFormat.h"
 
 #include <ArduinoJson.h>
 #include <algorithm>
@@ -12,6 +16,12 @@
 
 #ifdef HAS_BT
   #include <NimBLEDevice.h> // 1.3.8, 2.3.2
+
+  #ifdef HAS_NIMBLE_2
+    using MarauderBLEAdvertisedDevice = const NimBLEAdvertisedDevice;
+  #else
+    using MarauderBLEAdvertisedDevice = NimBLEAdvertisedDevice;
+  #endif
 #endif
 
 /*#ifdef HAS_IDF_3
@@ -32,11 +42,13 @@
 #include "mbedtls/bignum.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/ecp.h"
-#ifndef HAS_IDF_3
-  #include <lwip/etharp.h>
-  #include <lwip/ip_addr.h>
-#endif
+#include <lwip/etharp.h>
+#include <lwip/ip_addr.h>
+#include <lwip/netif.h>
+#include <lwip/tcpip.h>
 #ifdef HAS_IDF_3
+  #include "esp_netif.h"
+  #include "esp_netif_net_stack.h"
   #include "esp_system.h"
   #include "esp_mac.h"
 #endif
@@ -50,6 +62,7 @@
   #include "SDInterface.h"
 #endif
 #include "Buffer.h"
+#include "MemoryGuard.h"
 #ifdef HAS_BATTERY
   #include "BatteryInterface.h"
 #endif
@@ -57,10 +70,11 @@
   #include "GpsInterface.h"
 #endif
 #include "settings.h"
+#include "GeofenceMath.h"
 #include "Assets.h"
 #ifdef HAS_FLIPPER_LED
   #include "flipperLED.h"
-#elif defined(XIAO_ESP32_S3)
+#elif defined(XIAO_ESP32_S3) || defined(XIAO_ESP32_C5)
   #include "xiaoLED.h"
 #elif defined(MARAUDER_M5STICKC)
   #include "stickcLED.h"
@@ -70,8 +84,6 @@
 
 #ifdef HAS_DIRECT_UPLOAD
   #include <WiFiClientSecure.h>
-  #include <HTTPClient.h>
-  #include "mbedtls/sha256.h"
 #endif
 
 #define bad_list_length 3
@@ -164,10 +176,19 @@
 #define BT_ATTACK_APPLE_JUICE 82
 #define WIFI_SCAN_DISPLAY_AP_INFO 83
 #define BT_SCAN_FOX_HUNT 84
+#define BT_SCAN_IBEACON 85
 #define BT_FINDMY_SOUND 85
 #define BT_ATTACK_FINDMY_LIVE 86
+#define REMOTE_ID_SCAN_ALL 87
+#define REMOTE_ID_SCAN_TARGET 88
+#define WIFI_SCAN_CSI_MOTION 89
 
 #define WIFI_ATTACK_FUNNY_BEACON 99 
+
+#define ATTACK_AP_SCOPE_NONE 0
+#define ATTACK_AP_SCOPE_BROADCAST 1
+#define ATTACK_AP_SCOPE_ALL_STATIONS 2
+#define ATTACK_AP_SCOPE_PICK_STATIONS 3
 
 #define BASE_MULTIPLIER 4
 
@@ -241,7 +262,7 @@ extern Buffer buffer_obj;
 extern Settings settings_obj;
 #ifdef HAS_FLIPPER_LED
   extern flipperLED flipper_led;
-#elif defined(XIAO_ESP32_S3)
+#elif defined(XIAO_ESP32_S3) || defined(XIAO_ESP32_C5)
   extern xiaoLED xiao_led;
 #elif defined(MARAUDER_M5STICKC)
   extern stickcLED stickc_led;
@@ -346,13 +367,19 @@ struct AirTag {
 struct Flipper {
   String mac;
   String name;
+  int8_t rssi = -128;
+  uint32_t last_seen = 0;
 };
 
 struct BleDevice {
   uint8_t  mac[6];
   String   name;
+  String   device_type;
   bool     selected = false;
   int      rssi     = -128;
+  uint32_t last_seen_ms = 0;
+  bool     is_ibeacon = false;
+  marauder::IBeaconPayload ibeacon;
 };
 
 #ifdef HAS_PSRAM
@@ -368,6 +395,54 @@ enum class MacSortMode : uint8_t {
 class WiFiScan
 {
   private:
+#ifdef HAS_PSRAM
+    static constexpr size_t REMOTE_ID_CAPACITY = 24;
+#else
+    static constexpr size_t REMOTE_ID_CAPACITY = 12;
+#endif
+    RemoteIdRecord remote_id_records[REMOTE_ID_CAPACITY];
+    // GPX logging and display rendering are serialized on the main loop, so
+    // they can safely reuse one stable snapshot workspace.
+    RemoteIdRecord remote_id_snapshots[REMOTE_ID_CAPACITY];
+    RemoteIdStore remote_id_store{remote_id_records, REMOTE_ID_CAPACITY};
+    RemoteIdDecoder remote_id_decoder;
+    mutable portMUX_TYPE remote_id_mux = portMUX_INITIALIZER_UNLOCKED;
+    char remote_id_target_uas[21] = {};
+    uint8_t remote_id_target_mac[6] = {};
+    bool remote_id_target_has_uas = false;
+    bool remote_id_target_selected = false;
+    uint32_t remote_id_last_render_ms = 0;
+    uint8_t remote_id_schedule_step = 0;
+    uint8_t remote_id_beacon_channel_index = 0;
+    #ifdef HAS_SD
+      struct RemoteIdGpxTrack {
+        char uasId[21] = {};
+        uint8_t mac[6] = {};
+        char name[22] = {};
+        uint16_t pointCount = 0;
+        bool used = false;
+      };
+      String remote_id_gpx_file_name;
+      uint16_t remote_id_gpx_session_index = 0;
+      RemoteIdGpxTrack remote_id_gpx_tracks[REMOTE_ID_CAPACITY];
+      bool remote_id_gpx_active = false;
+      void startRemoteIdGpx();
+      void logRemoteIdGpxPositions(uint32_t nowMs);
+      void finishRemoteIdGpx();
+    #endif
+    static constexpr uint32_t REMOTE_ID_STALE_MS = 30000;
+    static constexpr uint32_t REMOTE_ID_EXPIRE_MS = 120000;
+    void RunRemoteIdScan(uint8_t scan_mode, uint16_t color);
+    void setupRemoteIdBle();
+    void renderRemoteIdGlobal();
+    void renderRemoteIdTarget();
+    void logRemoteIdRecord(const RemoteIdRecord& record);
+    void mergeRemoteIdRecord(RemoteIdRecord& destination,
+                             const RemoteIdRecord& source);
+    void hopRemoteIdChannel();
+    size_t snapshotRemoteIds(RemoteIdRecord* records, size_t capacity) const;
+    bool snapshotRemoteIdTarget(RemoteIdRecord& record) const;
+    static void remoteIdWifiCallback(void* buf, wifi_promiscuous_pkt_type_t type);
     // Wardriver thanks to https://github.com/JosephHewitt
     int arp_count = 0;
     #ifndef HAS_PSRAM
@@ -389,12 +464,28 @@ class WiFiScan
       WiFiClientSecure *client = new WiFiClientSecure();
     #endif
   
-    #if defined(HAS_SCREEN) && defined(HAS_ILI9341)
+    #if defined(HAS_SCREEN) && (defined(HAS_ILI9341) || \
+        (defined(MARAUDER_MINI_V3) && !defined(DUAL_MINI_C5)) || \
+        defined(MARAUDER_CARDPUTER) || defined(MARAUDER_CARDPUTER_ADV))
       static const uint8_t PACKET_MONITOR_COLUMN_WIDTH = 4;
-      static const uint8_t PACKET_MONITOR_GRAPH_LEFT = 32;
+      #if defined(MARAUDER_MINI_V3) || defined(MARAUDER_CARDPUTER) || defined(MARAUDER_CARDPUTER_ADV)
+        static const uint8_t PACKET_MONITOR_GRAPH_LEFT = 24;
+      #else
+        static const uint8_t PACKET_MONITOR_GRAPH_LEFT = 32;
+      #endif
       static const uint16_t PACKET_MONITOR_REFRESH_MS = 200;
-      static const uint16_t PACKET_MONITOR_HISTORY_LEN =
-          (SCREEN_WIDTH - PACKET_MONITOR_GRAPH_LEFT) / PACKET_MONITOR_COLUMN_WIDTH;
+      #if defined(MARAUDER_CARDPUTER) || defined(MARAUDER_CARDPUTER_ADV)
+        // Match the proven Mini v3 graph's 26-sample time window. The wider
+        // Cardputer panel changes only the horizontal spacing, not the data
+        // window, sampling cadence, scaling, or bar renderer.
+        static const uint16_t PACKET_MONITOR_HISTORY_LEN = (128 - 24) / 4;
+        static const uint8_t PACKET_MONITOR_COLUMN_STEP =
+            (SCREEN_WIDTH - PACKET_MONITOR_GRAPH_LEFT) / PACKET_MONITOR_HISTORY_LEN;
+      #else
+        static const uint16_t PACKET_MONITOR_HISTORY_LEN =
+            (SCREEN_WIDTH - PACKET_MONITOR_GRAPH_LEFT) / PACKET_MONITOR_COLUMN_WIDTH;
+        static const uint8_t PACKET_MONITOR_COLUMN_STEP = PACKET_MONITOR_COLUMN_WIDTH;
+      #endif
       uint16_t packet_monitor_beacons[PACKET_MONITOR_HISTORY_LEN] = {};
       uint16_t packet_monitor_deauths[PACKET_MONITOR_HISTORY_LEN] = {};
       uint16_t packet_monitor_probes[PACKET_MONITOR_HISTORY_LEN] = {};
@@ -411,14 +502,23 @@ class WiFiScan
     bool scan_complete = false;
 
     uint8_t wardrive_channel_index = 0;
+    GeofenceConfig geofences[MAX_GEOFENCES];
+    bool geofence_paused = false;
+    uint32_t last_geofence_check = 0;
+    String active_geofence_name = "";
+    bool updateGeofenceState(bool force = false);
+    void renderWardriveGeofenceState();
+    void drawWardriveGeofenceBadge();
 
     //int num_beacon = 0; // GREEN
     //int num_probe = 0; // BLUE
     //int num_deauth = 0; // RED
 
     uint32_t initTime = 0;
+    marauder::GpsTrackerStats gps_tracker_stats;
     uint32_t last_ui_update = 0;
     uint32_t last_sour_apple_update = 0;
+    uint32_t last_ibeacon_ui_update = 0;
     bool run_setup = true;
     void initWiFi(uint8_t scan_mode);
     uint8_t bluetoothScanTime = 5;
@@ -668,14 +768,6 @@ class WiFiScan
         NimBLEAdvertisementData ScanData;
       };
 
-      struct WatchModel
-      {
-          uint8_t value;
-          const char *name;
-      };
-
-      WatchModel* watch_models = nullptr;
-
       static void scanCompleteCB(BLEScanResults scanResults);
       NimBLEAdvertisementData GetUniversalAdvertisementData(EBLEPayloadType type);
     #endif
@@ -687,6 +779,7 @@ class WiFiScan
       bool sendFmnaSoundCommand(NimBLEClient* currentClient);
       bool sendDultSoundCommand(NimBLEClient* currentClient);
       bool enableTrackerResponses(NimBLERemoteCharacteristic* characteristic);
+      void releaseNimbleClient();
       void createNimbleClient();
       void initializeFindMyScan();
     #endif
@@ -700,7 +793,7 @@ class WiFiScan
     #endif
 
     void runFoxHunt(uint32_t currentTime);
-    void throwThatShitInACircle();
+    bool throwThatShitInACircle();
     void displayTargetFilter();
     void displayTransmitRate();
     void prepareScanStage(uint16_t color_1, uint16_t color_2);
@@ -709,16 +802,20 @@ class WiFiScan
     void writeNetworkInfo();
     void setupScanDisplayArea(uint16_t background, uint16_t color);
     void updateTrackerUI();
-    void showNetworkInfo();
+    void showNetworkInfo(bool show_display = true);
+    void resetNetworkScanDisplay(const String& target_line, const String& status_line);
+    void addNetworkScanDisplayResult(const String& result_line);
+    void finishNetworkScanDisplay(const String& result_label);
     void setNetworkInfo();
     void fullARP();
     bool readARP(IPAddress targ_ip);
     bool singleARP(IPAddress ip_addr);
     void pingScan(uint8_t scan_mode = WIFI_PING_SCAN);
     void portScan(uint8_t scan_mode = WIFI_PORT_SCAN_ALL, uint16_t targ_port = 22);
+    IPAddress advanceScanIP();
     bool isHostAlive(IPAddress ip);
     bool checkHostPort(IPAddress ip, uint16_t port, uint16_t timeout = 100);
-    String extractManufacturer(const uint8_t* payload);
+    String extractManufacturer(const uint8_t* payload, size_t payload_len);
     int checkMatchAP(char addr[], bool update_ap = true);
     uint8_t getSecurityType(const uint8_t* beacon, uint16_t len);
     void addAnalyzerValue(int16_t value, int rssi_avg, int16_t target_array[], int array_size);
@@ -776,7 +873,7 @@ class WiFiScan
     void RunEvilPortal(uint8_t scan_mode, uint16_t color);
     void RunPingScan(uint8_t scan_mode, uint16_t color);
     void RunPortScanAll(uint8_t scan_mode, uint16_t color);
-    bool checkMem();
+    bool checkMem(size_t requestedBytes = 0);
     void writeHeader(bool poi = false);
     void writeFooter(bool poi = false);
     void displayWardriveStats();
@@ -802,6 +899,18 @@ class WiFiScan
 
     bool send_deauth = false;
 
+    bool processRemoteIdWifiFrame(const uint8_t* frame, size_t length,
+                                  const uint8_t mac[6], int8_t rssi,
+                                  uint8_t channel);
+    bool processRemoteIdBlePayload(const uint8_t* payload, size_t length,
+                                   const uint8_t mac[6], int8_t rssi,
+                                   RemoteIdTransport transport =
+                                       RemoteIdTransport::BleLegacy);
+    size_t remoteIdCount() const;
+    String remoteIdLabel(size_t index) const;
+    bool selectRemoteIdTarget(size_t index);
+    void clearRemoteIds();
+
     size_t retainedAccessPointCount() const;
     size_t retainedStationCount() const;
     size_t retainedBleDeviceCount() const;
@@ -813,7 +922,7 @@ class WiFiScan
     static MacEntry mac_entries[mac_history_len_half];
     static uint8_t mac_entry_state[mac_history_len_half];
 
-    String header_line = "WigleWifi-1.4,appRelease=" + (String)MARAUDER_VERSION + ",model=ESP32 Marauder,release=" + (String)MARAUDER_VERSION + ",device=ESP32 Marauder,display=SPI TFT,board=ESP32 Marauder,brand=JustCallMeKoko\nMAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n";
+    String header_line = "WigleWifi-1.6,appRelease=" + (String)MARAUDER_VERSION + ",model=ESP32 Marauder,release=" + (String)MARAUDER_VERSION + ",device=ESP32 Marauder,display=SPI TFT,board=ESP32 Marauder,brand=JustCallMeKoko\n" + WIGLE_CSV_COLUMNS + "\n";
 
     uint8_t dual_band_channels[DUAL_BAND_CHANNELS] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177};
 
@@ -924,14 +1033,19 @@ class WiFiScan
     String free_ram = "";
     String old_free_ram = "";
     String connected_network = "";
+    char pending_wifi_ssid[33] = {};
+    char pending_wifi_password[64] = {};
+    bool pending_wifi_credential = false;
 
     IPAddress ip_addr;
     IPAddress gateway;
     IPAddress subnet;
 
     IPAddress current_scan_ip;
+    IPAddress last_scan_ip;
 
     uint16_t current_scan_port = 1;
+    uint16_t network_scan_result_count = 0;
 
     String dst_mac = "ff:ff:ff:ff:ff:ff";
     byte src_mac[6] = {};
@@ -997,9 +1111,16 @@ class WiFiScan
     bool startWiFi(String ssid, String password, bool gui = true);
     bool isFlockCamera(const uint8_t* payload, size_t len, const String& name, String* serial_out);
     int seenBLEDevice(BleDevice ble_device);
+    bool retainBLEDevice(const BleDevice& ble_device);
+    bool shouldRenderIBeaconEvent(uint32_t current_time);
     uint16_t rssiToColor(int8_t rssi);
     bool isMetaIdentifier(uint16_t id);
     bool isBlockedIdentifier(uint16_t id);
+    #ifdef HAS_BT
+      String classifyBLEDevice(MarauderBLEAdvertisedDevice* advertised_device);
+      void retainBLEFoxHuntSubtype(MarauderBLEAdvertisedDevice* advertised_device,
+                                   const BleDevice& ble_device);
+    #endif
     void setFoxHuntTarget(const uint8_t mac[6], const String& name, int8_t rssi, uint8_t channel, bool bluetooth, const String& advertised_address = "");
     bool updateFoxHuntRssi(const uint8_t mac[6], int8_t rssi, uint8_t channel = 0);
     bool updateBluetoothFoxHuntRssi(const uint8_t mac[6], const String& advertised_address, int8_t rssi);
@@ -1021,7 +1142,7 @@ class WiFiScan
     bool seen_mac(unsigned char* mac, bool simple = true);
     int update_mac_entry(const uint8_t mac[6], int8_t rssi = 0, bool bt = false);
     inline void insert_mac_entry(uint32_t idx, const uint8_t mac[6], uint32_t now_ms, int8_t rssi = 0, bool bt = false);
-    void evict_and_insert(const uint8_t mac[6], uint32_t now_ms);
+    void evict_and_insert(const uint8_t mac[6], uint32_t now_ms, int8_t rssi, bool bt);
     uint8_t build_top10_for_ui(MacEntry* out_top10, MacSortMode mode);
     void save_mac(unsigned char* mac);
     #ifdef HAS_BT
@@ -1045,11 +1166,18 @@ class WiFiScan
     bool shutdownWiFi();
     bool shutdownBLE();
     bool scanning();
-    bool joinWiFi(String ssid, String password, bool gui = true);
+    bool joinWiFi(String ssid, String password, bool gui = true, bool save_credential = true);
+    bool joinSavedWiFi(bool gui = true);
+    void reloadGeofences();
+    bool isGeofencePaused() const { return geofence_paused; }
+    bool hasPendingWifiCredential() const;
+    bool savePendingWifiCredential(uint8_t replace_index);
+    void discardPendingWifiCredential();
     void getMAC(bool get_sta, uint8_t* mac);
     void changeChannel(int chan = -1);
     void RunAPInfo(uint16_t index, bool do_display = true);
     void RunInfo();
+    bool setStationSelected(uint16_t index, bool selected);
     void RunSetMac(uint8_t * mac, bool ap = true);
     void RunGenerateRandomMac(bool ap = true);
     void RunGenerateSSIDs(int count = 20);
@@ -1065,6 +1193,7 @@ class WiFiScan
     void RunSetupGPSTracker(uint8_t scan_mode);
     void channelHop(bool filtered = false, bool ranged = false);
     uint8_t currentScanMode = 0;
+    bool guided_attack_profile = false;
     void main(uint32_t currentTime);
     void StartScan(uint8_t scan_mode, uint16_t color = 0);
     void StopScan(uint8_t scan_mode);
