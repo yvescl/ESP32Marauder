@@ -33,9 +33,30 @@ void setup() {
   logLine("SD card diagnostic");
   logLine("");
 
+  // Keep the display deselected while the SD card is probed.
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
-  if (!SD.begin(SD_CS, sdSPI)) {
+  // Retry at slower clocks: jumper-wire wiring often fails at the default speed.
+  const uint32_t speeds[] = {400000, 1000000, 4000000, 20000000};
+  bool mounted = false;
+  for (uint32_t hz : speeds) {
+    SD.end();
+    bool ok = SD.begin(SD_CS, sdSPI, hz);
+    logLine(String(hz / 1000) + " kHz: " + (ok ? "OK" : "fail"));
+    mounted = mounted || ok;
+    delay(200);
+  }
+  // Leave the card mounted at the last speed that worked for the checks below.
+  if (mounted) {
+    SD.end();
+    for (int i = 3; i >= 0 && !SD.begin(SD_CS, sdSPI, speeds[i]); i--) {}
+  }
+  logLine("");
+
+  if (!mounted) {
     logLine("SD.begin() FAILED.");
     logLine("Card not mounted -");
     logLine("likely unformatted,");
