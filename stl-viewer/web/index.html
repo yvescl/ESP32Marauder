@@ -1,0 +1,408 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STL Viewer</title>
+<style>
+  :root{ --bg:#0b0b0d; --card:#1e1e1e; --ink:#eee; --muted:#8b8b8b; --line:#2c2c2c;
+         --accent:#6ab0f3; --ok:#5fd08a; --bad:#e77; }
+  *{ box-sizing:border-box; }
+  body{ font-family:system-ui,sans-serif; background:#111; color:var(--ink);
+        margin:0; padding:14px; max-width:1000px; margin:0 auto; }
+  h1{ font-size:1.15em; margin:0 0 4px; }
+  a{ color:var(--accent); text-decoration:none; } a:hover{ text-decoration:underline; }
+  .top{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+  .drop{ border:1.5px dashed #3a3a3a; border-radius:12px; padding:18px; text-align:center;
+         color:var(--muted); margin:12px 0; cursor:pointer; transition:border-color .15s,background .15s; }
+  .drop.hot{ border-color:var(--accent); background:rgba(106,176,243,.08); color:var(--ink); }
+  .drop b{ color:var(--ink); }
+  .stage{ position:relative; background:var(--bg); border-radius:12px; overflow:hidden;
+          border:1px solid var(--line); }
+  canvas#gl{ width:100%; height:460px; display:block; }
+  @media(max-width:600px){ canvas#gl{ height:340px; } }
+  .badge{ position:absolute; top:10px; left:10px; font-size:.74em; font-weight:700;
+          padding:4px 10px; border-radius:999px; background:#23313d; color:#7fb3d8; }
+  .badge.ok{ background:rgba(95,208,138,.16); color:var(--ok); }
+  .badge.bad{ background:rgba(231,119,119,.16); color:var(--bad); }
+  .hint{ position:absolute; bottom:8px; right:10px; font-size:.72em; color:var(--muted);
+         background:rgba(0,0,0,.35); padding:3px 8px; border-radius:8px; }
+  .tiles{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:12px 0; }
+  @media(max-width:600px){ .tiles{ grid-template-columns:1fr 1fr; } }
+  .tile{ background:var(--card); border-radius:10px; padding:12px; text-align:center; }
+  .tile b{ display:block; font-size:1.25em; font-weight:700; line-height:1.1;
+           font-variant-numeric:tabular-nums; }
+  .tile span{ color:var(--muted); font-size:.72em; display:block; margin-top:5px; }
+  .note{ color:var(--muted); font-size:.82em; line-height:1.5; }
+  .err{ color:var(--bad); font-size:.9em; margin:8px 0; }
+  .saved{ background:var(--card); border-radius:12px; padding:12px 14px; margin:12px 0; }
+  .saved h2{ font-size:.85em; color:var(--muted); font-weight:600; margin:0 0 8px;
+             text-transform:uppercase; letter-spacing:.04em; }
+  .item{ display:flex; align-items:center; gap:10px; padding:8px 6px; border-radius:8px;
+         cursor:pointer; border-bottom:1px solid var(--line); }
+  .item:last-child{ border-bottom:none; }
+  .item:hover{ background:#242424; }
+  .item .nm{ flex:1 1 auto; min-width:0; font-weight:600; overflow:hidden;
+             text-overflow:ellipsis; white-space:nowrap; }
+  .item .meta{ color:var(--muted); font-size:.78em; font-variant-numeric:tabular-nums; }
+  .item .fb{ font-size:.68em; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .item .fb.ok{ background:rgba(95,208,138,.16); color:var(--ok); }
+  .item .fb.bad{ background:rgba(231,119,119,.16); color:var(--bad); }
+  .item .dl{ text-decoration:none; font-size:1.1em; padding:2px 6px; border-radius:6px;
+             color:var(--accent); }
+  .item .dl:hover{ background:#2c4a6e; }
+  .empty{ color:var(--muted); font-size:.82em; padding:4px 6px; }
+  .ctl{ position:absolute; top:10px; right:10px; display:flex; align-items:center; gap:10px;
+        font-size:.76em; background:rgba(0,0,0,.45); padding:4px 10px; border-radius:999px; }
+  .ctl label{ cursor:pointer; user-select:none; }
+  .ctl button{ background:none; border:1px solid #3a3a3a; color:var(--muted); border-radius:999px;
+               font-size:.95em; padding:1px 8px; cursor:pointer; }
+  .item .gh{ background:none; border:none; font-size:1.05em; padding:2px 6px; border-radius:6px;
+             cursor:pointer; opacity:.55; }
+  .item .gh:hover{ background:#2c4a6e; opacity:1; }
+  .item .gh.on{ opacity:1; background:#4a3a1e; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>STL Viewer</h1>
+  </div>
+
+  <div class="drop" id="drop">
+    <b>Drop an STL here</b> or click to choose &mdash; binary or ASCII.
+    <input type="file" id="file" accept=".stl,model/stl,application/sla" hidden>
+  </div>
+  <div class="err" id="err" hidden></div>
+
+  <div class="stage">
+    <canvas id="gl"></canvas>
+    <div class="badge" id="badge" hidden></div>
+    <div class="ctl">
+      <label title="draw the main model see-through"><input type="checkbox" id="xray"> see-through</label>
+      <span id="ghostname" style="color:var(--muted)">no ghost</span>
+      <button id="ghostclear" hidden>clear ghost</button>
+    </div>
+    <div class="hint">drag: orbit &middot; wheel: zoom &middot; shift-drag: pan</div>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><b id="t-tri">&mdash;</b><span>triangles</span></div>
+    <div class="tile"><b id="t-size">&mdash;</b><span>size (X&times;Y&times;Z mm)</span></div>
+    <div class="tile"><b id="t-vol">&mdash;</b><span>volume (cm&sup3;)</span></div>
+    <div class="tile"><b id="t-fit">&mdash;</b><span>fit on bed</span></div>
+  </div>
+
+  <p class="note">Uploaded STLs are kept on the server so you can find them again
+    &mdash; including ones sent with <code>curl -F file=@model.stl /api/models</code>.
+    The grid is the print bed (<span id="bedtxt">220&times;220</span>&nbsp;mm); the
+    model rests on it at Z=0 so you can eyeball the fit.</p>
+
+  <div class="saved">
+    <h2>Saved models <span id="count" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div id="list"><div class="empty">loading&hellip;</div></div>
+  </div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+// ---- tiny mat4 (same helpers as the g-code replay) ----------------------
+function mul(a,b){ const o=new Float32Array(16);
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s;}
+  return o; }
+function persp(fov,asp,n,f){ const t=1/Math.tan(fov/2),o=new Float32Array(16);
+  o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f);return o; }
+function lookAt(eye,ctr,up){
+  const z=[eye[0]-ctr[0],eye[1]-ctr[1],eye[2]-ctr[2]];
+  let l=Math.hypot(z[0],z[1],z[2])||1; z[0]/=l;z[1]/=l;z[2]/=l;
+  const x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]];
+  l=Math.hypot(x[0],x[1],x[2])||1; x[0]/=l;x[1]/=l;x[2]/=l;
+  const y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]];
+  return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+    -(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]),
+    -(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]),
+    -(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]),1]); }
+function translate(tx,ty,tz){ return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,tx,ty,tz,1]); }
+
+// ---- GL -----------------------------------------------------------------
+const cv = $('#gl');
+const gl = cv.getContext('webgl', {antialias:true});
+let prog, aPos, aNorm, uMVP, uColor, uLight, uAmbient, uLit, uAlpha;
+function compile(src,type){ const s=gl.createShader(type); gl.shaderSource(s,src);
+  gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s; }
+function initGL(){
+  const vs=compile(`attribute vec3 aPos; attribute vec3 aNorm; uniform mat4 uMVP;
+    varying vec3 vN; void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aNorm; }`, gl.VERTEX_SHADER);
+  const fs=compile(`precision mediump float; varying vec3 vN;
+    uniform vec3 uColor; uniform vec3 uLight; uniform float uAmbient; uniform float uLit; uniform float uAlpha;
+    void main(){
+      if(uLit<0.5){ gl_FragColor=vec4(uColor,1.0); return; }
+      vec3 N=normalize(vN); vec3 L=normalize(uLight);
+      float d=max(max(dot(N,L),dot(-N,L)),0.0);        // two-sided (STL winding varies)
+      vec3 c=uColor*(uAmbient+(1.0-uAmbient)*d);
+      gl_FragColor=vec4(c,uAlpha);
+    }`, gl.FRAGMENT_SHADER);
+  prog=gl.createProgram(); gl.attachShader(prog,vs); gl.attachShader(prog,fs);
+  gl.linkProgram(prog); gl.useProgram(prog);
+  aPos=gl.getAttribLocation(prog,'aPos'); aNorm=gl.getAttribLocation(prog,'aNorm');
+  uMVP=gl.getUniformLocation(prog,'uMVP'); uColor=gl.getUniformLocation(prog,'uColor');
+  uLight=gl.getUniformLocation(prog,'uLight'); uAmbient=gl.getUniformLocation(prog,'uAmbient');
+  uLit=gl.getUniformLocation(prog,'uLit'); uAlpha=gl.getUniformLocation(prog,'uAlpha');
+  gl.enable(gl.DEPTH_TEST); gl.clearColor(0.043,0.043,0.051,1);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+}
+initGL();
+function buf(data){ const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+  gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW); return b; }
+
+// ---- bed grid (Ender 3 V2: 220 x 220) -----------------------------------
+let BEDX=220, BEDY=220, BEDZ=250;      // overwritten from /config.json
+let bedPos, bedNorm, bedN;
+function buildBed(){ const p=[];
+  function line(x1,y1,z1,x2,y2,z2){ p.push(x1,y1,z1,x2,y2,z2); }
+  for(let i=0;i<=BEDX;i+=10) line(i,0,0,i,BEDY,0);
+  for(let i=0;i<=BEDY;i+=10) line(0,i,0,BEDX,i,0);
+  const arr=new Float32Array(p); bedPos=buf(arr);
+  bedNorm=buf(new Float32Array(arr.length)); bedN=arr.length/3;
+}
+buildBed();
+
+// ---- model --------------------------------------------------------------
+let mPos=null, mNorm=null, mN=0, model=translate(0,0,0);
+// camera (orbit around target)
+let tgt=[BEDX/2,BEDY/2,60], theta=-0.9, phi=0.55, radius=380;
+
+function fitCamera(h){
+  const mn=h.bbox_min, mx=h.bbox_max;
+  const cx=(mn[0]+mx[0])/2, cy=(mn[1]+mx[1])/2;
+  // rest on bed (z=0) and centre the footprint over the bed centre
+  model=translate(BEDX/2-cx, BEDY/2-cy, -mn[2]);
+  const sz=h.size_xyz, diag=Math.hypot(sz[0],sz[1],sz[2])||100;
+  tgt=[BEDX/2, BEDY/2, sz[2]/2];
+  radius=Math.max(diag*1.8, 120); theta=-0.9; phi=0.5;
+}
+
+function draw(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const w=cv.clientWidth, h=cv.clientHeight;
+  if(cv.width!==w*dpr||cv.height!==h*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
+  gl.viewport(0,0,cv.width,cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+  const cp=Math.cos(phi);
+  const eye=[tgt[0]+radius*cp*Math.cos(theta), tgt[1]+radius*cp*Math.sin(theta),
+             tgt[2]+radius*Math.sin(phi)];
+  const V=lookAt(eye,tgt,[0,0,1]);
+  const P=persp(1.05, cv.width/cv.height, 1, 5000);
+  const VP=mul(P,V);
+
+  gl.uniform3f(uLight, 0.3, -0.55, 1.0);
+  gl.uniform1f(uAmbient, 0.32);
+
+  // bed (flat grey lines)
+  gl.uniformMatrix4fv(uMVP,false,VP);
+  gl.uniform1f(uLit,0.0); gl.uniform3f(uColor,0.20,0.22,0.27);
+  gl.bindBuffer(gl.ARRAY_BUFFER,bedPos); gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,bedNorm); gl.enableVertexAttribArray(aNorm);
+  gl.vertexAttribPointer(aNorm,3,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.LINES,0,bedN);
+
+  // ghost overlay: drawn first and opaque, so it shows through a see-through main model.
+  // It uses the main model's transform, so both stay aligned if they share coordinates.
+  if(gPos) drawMesh(VP, gPos, gNorm, gN, [0.98,0.62,0.22], 1.0);
+
+  // model (lit triangles)
+  if(mPos){
+    const xr=$('#xray').checked;
+    if(xr){ gl.enable(gl.BLEND); gl.depthMask(false); }
+    drawMesh(VP, mPos, mNorm, mN, [0.56,0.68,0.85], xr?0.28:1.0);
+    if(xr){ gl.depthMask(true); gl.disable(gl.BLEND); }
+  }
+}
+
+function drawMesh(VP, pos, nrm, n, col, alpha){
+  gl.uniformMatrix4fv(uMVP,false,mul(VP,model));
+  gl.uniform1f(uLit,1.0); gl.uniform3f(uColor,col[0],col[1],col[2]); gl.uniform1f(uAlpha,alpha);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pos); gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,nrm); gl.enableVertexAttribArray(aNorm);
+  gl.vertexAttribPointer(aNorm,3,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.TRIANGLES,0,n);
+}
+
+// ---- ghost overlay ------------------------------------------------------
+let gPos=null, gNorm=null, gN=0, ghostStored=null;
+function setGhost(buf0, label, stored){
+  const dv=new DataView(buf0);
+  const hl=dv.getUint32(0,true);
+  const head=JSON.parse(new TextDecoder().decode(new Uint8Array(buf0,4,hl)));
+  let o=4+hl; const nv=head.n_vert;
+  const pos=new Float32Array(buf0,o,nv*3); o+=nv*3*4;
+  const nrm=new Float32Array(buf0,o,nv*3);
+  if(gPos){ gl.deleteBuffer(gPos); gl.deleteBuffer(gNorm); }
+  gPos=buf(pos); gPos.n=nv; gNorm=buf(nrm); gN=nv; ghostStored=stored;
+  $('#ghostname').textContent='ghost: '+label; $('#ghostname').style.color='#f0a050';
+  $('#ghostclear').hidden=false;
+  $('#xray').checked=true;              // a ghost inside an opaque model would be hidden
+  draw();
+}
+function clearGhost(){
+  if(gPos){ gl.deleteBuffer(gPos); gl.deleteBuffer(gNorm); }
+  gPos=gNorm=null; gN=0; ghostStored=null;
+  $('#ghostname').textContent='no ghost'; $('#ghostname').style.color='';
+  $('#ghostclear').hidden=true; loadList(); draw();
+}
+async function loadGhost(stored, label){
+  $('#err').hidden=true;
+  try{
+    const r=await fetch('/model/data?name='+encodeURIComponent(stored));
+    const buf0=await r.arrayBuffer();
+    if(!r.ok){
+      let msg='not found'; try{ msg=JSON.parse(new TextDecoder().decode(buf0)).error||msg; }catch(_){}
+      throw new Error(msg);
+    }
+    setGhost(buf0, label, stored); loadList();
+  }catch(err){ fail(err); }
+}
+$('#xray').addEventListener('change',draw);
+$('#ghostclear').addEventListener('click',clearGhost);
+
+// ---- interaction --------------------------------------------------------
+let drag=null;
+cv.addEventListener('mousedown',e=>{ drag={x:e.clientX,y:e.clientY,pan:e.shiftKey||e.button===2}; });
+window.addEventListener('mouseup',()=>drag=null);
+window.addEventListener('mousemove',e=>{
+  if(!drag) return;
+  const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
+  if(drag.pan){
+    const cp=Math.cos(theta), sp=Math.sin(theta);
+    const k=radius*0.0018;
+    tgt[0]-= (-sp*dx)*k;  tgt[1]-= (cp*dx)*k;   // pan in bed plane
+    tgt[2]+= dy*k;
+  } else {
+    theta-=dx*0.008; phi=Math.max(-1.45,Math.min(1.45,phi+dy*0.008));
+  }
+  draw();
+});
+cv.addEventListener('wheel',e=>{ e.preventDefault();
+  radius=Math.max(20,Math.min(3000,radius*(e.deltaY>0?1.1:0.9))); draw(); },{passive:false});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+window.addEventListener('resize',draw);
+
+// ---- load ---------------------------------------------------------------
+const drop=$('#drop'), fileIn=$('#file');
+drop.addEventListener('click',()=>fileIn.click());
+fileIn.addEventListener('change',()=>{ if(fileIn.files[0]) load(fileIn.files[0]); });
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{
+  e.preventDefault(); drop.classList.add('hot'); }));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{
+  e.preventDefault(); drop.classList.remove('hot'); }));
+drop.addEventListener('drop',e=>{ const f=e.dataTransfer.files[0]; if(f) load(f); });
+
+// Render a mesh blob (<u4 len><json header><pos f32><normal f32>) into the viewer.
+function showBlob(buf0, fallbackName){
+  const dv=new DataView(buf0);
+  const hl=dv.getUint32(0,true);
+  const head=JSON.parse(new TextDecoder().decode(new Uint8Array(buf0,4,hl)));
+  let o=4+hl; const nv=head.n_vert;
+  const pos=new Float32Array(buf0,o,nv*3); o+=nv*3*4;
+  const nrm=new Float32Array(buf0,o,nv*3);
+  if(mPos){ gl.deleteBuffer(mPos); gl.deleteBuffer(mNorm); }
+  mPos=buf(pos); mNorm=buf(nrm); mN=nv;
+  fitCamera(head); fillStats(head); draw();
+  return head.name||fallbackName;
+}
+
+function fail(err){
+  $('#err').textContent='Could not load: '+err.message; $('#err').hidden=false;
+  drop.innerHTML='<b>Drop an STL here</b> or click to choose.';
+}
+
+// A freshly-dropped file: upload (which also stores it) and render.
+async function load(file){
+  $('#err').hidden=true;
+  drop.innerHTML=`Loading <b>${file.name}</b>&hellip;`;
+  try{
+    const bytes=await file.arrayBuffer();
+    const r=await fetch('/model/stl?name='+encodeURIComponent(file.name),
+                        {method:'POST', body:bytes});
+    const buf0=await r.arrayBuffer();
+    if(!r.ok){
+      let msg='parse failed';
+      try{ msg=JSON.parse(new TextDecoder().decode(buf0)).error||msg; }catch(_){}
+      throw new Error(msg);
+    }
+    const nm=showBlob(buf0, file.name);
+    drop.innerHTML=`<b>${nm}</b> loaded &mdash; drop another to replace.`;
+    loadList();                         // it's now saved; refresh the list
+  }catch(err){ fail(err); }
+}
+
+// A previously-saved model, opened from the list.
+async function loadSaved(stored, label){
+  $('#err').hidden=true;
+  try{
+    const r=await fetch('/model/data?name='+encodeURIComponent(stored));
+    const buf0=await r.arrayBuffer();
+    if(!r.ok){
+      let msg='not found'; try{ msg=JSON.parse(new TextDecoder().decode(buf0)).error||msg; }catch(_){}
+      throw new Error(msg);
+    }
+    const nm=showBlob(buf0, label);
+    drop.innerHTML=`<b>${nm}</b> loaded &mdash; drop an STL to add another.`;
+  }catch(err){ fail(err); }
+}
+
+async function loadList(){
+  try{
+    const j=await (await fetch('/api/models')).json();
+    const items=j.models||[];
+    $('#count').textContent=items.length?`· ${items.length}`:'';
+    const el=$('#list');
+    if(!items.length){ el.innerHTML='<div class="empty">No uploads yet. Drop one above, or POST to /api/models.</div>'; return; }
+    el.innerHTML='';
+    for(const m of items){
+      const row=document.createElement('div'); row.className='item';
+      const kb=(m.bytes/1024); const sz=kb>=1024?(kb/1024).toFixed(1)+' MB':Math.round(kb)+' KB';
+      const when=(m.uploaded||'').replace('T',' ').slice(0,16);
+      const fb=('fits_bed' in m)?`<span class="fb ${m.fits_bed?'ok':'bad'}">${m.fits_bed?'fits':'over'}</span>`:'';
+      row.innerHTML=`<span class="nm">${m.name}</span>`+
+                    `<span class="meta">${m.size_mm?m.size_mm+' · ':''}${sz} · ${when}</span>${fb}`+
+                    `<button class="gh${m.stored===ghostStored?' on':''}" title="show as ghost overlay on the main model">👻</button>`+
+                    `<a class="dl" href="/model/file?name=${encodeURIComponent(m.stored)}"`+
+                    ` download="${m.name}" title="download original STL">⬇</a>`;
+      row.onclick=()=>loadSaved(m.stored, m.name);
+      const dl=row.querySelector('.dl'); if(dl) dl.addEventListener('click',e=>e.stopPropagation());
+      row.querySelector('.gh').addEventListener('click',e=>{
+        e.stopPropagation();
+        if(m.stored===ghostStored) clearGhost(); else loadGhost(m.stored, m.name);
+      });
+      el.appendChild(row);
+    }
+  }catch(_){ $('#list').innerHTML='<div class="empty">could not load list</div>'; }
+}
+
+function fillStats(h){
+  $('#t-tri').textContent=h.triangles.toLocaleString();
+  const s=h.size_xyz;
+  $('#t-size').textContent=`${s[0]} × ${s[1]} × ${s[2]}`;
+  $('#t-vol').textContent=h.volume_cm3.toLocaleString();
+  const fit=$('#t-fit'), badge=$('#badge');
+  fit.textContent=h.fits_bed?'yes':'too big';
+  fit.style.color=h.fits_bed?'var(--ok)':'var(--bad)';
+  badge.hidden=false;
+  const bs=`${BEDX}×${BEDY}×${BEDZ}`;
+  badge.textContent=h.fits_bed?`fits the ${bs} bed`:`exceeds the ${bs} bed`;
+  badge.className='badge '+(h.fits_bed?'ok':'bad');
+}
+// Bed size comes from the server (BED_X / BED_Y / BED_Z), then draw the grid.
+fetch('/config.json').then(r=>r.json()).then(c=>{
+  [BEDX,BEDY,BEDZ]=c.bed; $('#bedtxt').innerHTML=`${BEDX}&times;${BEDY}`;
+  buildBed(); tgt=[BEDX/2,BEDY/2,60]; draw();
+}).catch(()=>{});
+draw();
+loadList();
+</script>
+</body>
+</html>

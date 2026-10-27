@@ -1,0 +1,10 @@
+services:
+  stl-viewer:
+    build: .
+    ports: ["8765:8765"]
+    volumes: ["./data:/data"]       # uploads survive rebuilds
+    environment:
+      BED_X: 220
+      BED_Y: 220
+      BED_Z: 250
+    restart: unless-stopped
